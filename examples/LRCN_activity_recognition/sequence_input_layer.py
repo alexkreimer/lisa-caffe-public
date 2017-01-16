@@ -21,14 +21,13 @@ from threading import Thread
 import skimage.io
 import copy
 
-flow_frames = 'flow_images/'
-RGB_frames = 'frames/'
-test_frames = 16 
-train_frames = 16
-test_buffer = 3
-train_buffer = 24
+class settings:
+  train_images_list  = './train_images.txt'
+  test_images_list   = './test_images.txt'  
+  test_frames        = 16 #number of frames to process in a batch
+  train_frames       = 16
 
-def processImageCrop(im_info, transformer, flow):
+def processImageCrop(im_info, transformer):
   im_path = im_info[0]
   im_crop = im_info[1] 
   im_reshape = im_info[2]
@@ -39,70 +38,23 @@ def processImageCrop(im_info, transformer, flow):
   if im_flip:
     data_in = caffe.io.flip_image(data_in, 1, flow) 
     data_in = data_in[im_crop[0]:im_crop[2], im_crop[1]:im_crop[3], :] 
-  processed_image = transformer.preprocess('data_in',data_in)
-  return processed_image
+  return transformer.preprocess('data_in', data_in)
 
 class ImageProcessorCrop(object):
-  def __init__(self, transformer, flow):
+  def __init__(self, transformer):
     self.transformer = transformer
-    self.flow = flow
   def __call__(self, im_info):
-    return processImageCrop(im_info, self.transformer, self.flow)
+    return processImageCrop(im_info, self.transformer)
 
-class sequenceGeneratorVideo(object):
-  def __init__(self, buffer_size, clip_length, num_videos, video_dict, video_order):
-    self.buffer_size = buffer_size
-    self.clip_length = clip_length
-    self.N = self.buffer_size*self.clip_length
-    self.num_videos = num_videos
-    self.video_dict = video_dict
-    self.video_order = video_order
+class SequenceGenerator(object):
+
+  def __init__(self, frames):
+    self.frames = frames
     self.idx = 0
 
   def __call__(self):
-    label_r = []
-    im_paths = []
-    im_crop = []
-    im_reshape = []  
-    im_flip = []
- 
-    if self.idx + self.buffer_size >= self.num_videos:
-      idx_list = range(self.idx, self.num_videos)
-      idx_list.extend(range(0, self.buffer_size-(self.num_videos-self.idx)))
-    else:
-      idx_list = range(self.idx, self.idx+self.buffer_size)
+    return self.frames[self.idx:self.idx+self.batch_size]
     
-
-    for i in idx_list:
-      key = self.video_order[i]
-      label = self.video_dict[key]['label']
-      video_reshape = self.video_dict[key]['reshape']
-      video_crop = self.video_dict[key]['crop']
-      label_r.extend([label]*self.clip_length)
-
-      im_reshape.extend([(video_reshape)]*self.clip_length)
-      r0 = int(random.random()*(video_reshape[0] - video_crop[0]))
-      r1 = int(random.random()*(video_reshape[1] - video_crop[1]))
-      im_crop.extend([(r0, r1, r0+video_crop[0], r1+video_crop[1])]*self.clip_length)     
-      f = random.randint(0,1)
-      im_flip.extend([f]*self.clip_length)
-      rand_frame = int(random.random()*(self.video_dict[key]['num_frames']-self.clip_length)+1+1)
-      frames = []
-
-      for i in range(rand_frame,rand_frame+self.clip_length):
-        frames.append(self.video_dict[key]['frames'] %i)
-     
-      im_paths.extend(frames) 
-    
-    
-    im_info = zip(im_paths,im_crop, im_reshape, im_flip)
-
-    self.idx += self.buffer_size
-    if self.idx >= self.num_videos:
-      self.idx = self.idx - self.num_videos
-
-    return label_r, im_info
-  
 def advance_batch(result, sequence_generator, image_processor, pool):
   
     label_r, im_info = sequence_generator()
@@ -123,59 +75,42 @@ class BatchAdvancer():
     def __call__(self):
       return advance_batch(self.result, self.sequence_generator, self.image_processor, self.pool)
 
-class videoRead(caffe.Layer):
+class SequenceRead(caffe.Layer):
 
   def initialize(self):
-    self.train_or_test = 'test'
-    self.flow = False
-    self.buffer_size = test_buffer  #num videos processed per batch
-    self.frames = test_frames   #length of processed clip
-    self.N = self.buffer_size*self.frames
-    self.idx = 0
+    self.idx      = 0
     self.channels = 3
-    self.height = 227
-    self.width = 227
-    self.path_to_images = RGB_frames 
-    self.video_list = 'ucf101_split1_testVideos.txt' 
+    self.channels = 1
+    self.height   = 1241
+    self.width    = 376
+    self.scale    = 4
 
   def setup(self, bottom, top):
     random.seed(10)
     self.initialize()
-    f = open(self.video_list, 'r')
-    f_lines = f.readlines()
-    f.close()
+    
+    with open(self.path_to_image_list, 'r') as fd:
+      f_lines = fd.readlines()
 
-    video_dict = {}
-    current_line = 0
-    self.video_order = []
+    self.frames = []
     for ix, line in enumerate(f_lines):
-      video = line.split(' ')[0].split('/')[1]
-      l = int(line.split(' ')[1])
-      frames = glob.glob('%s%s/*.jpg' %(self.path_to_images, video))
-      num_frames = len(frames)
-      video_dict[video] = {}
-      video_dict[video]['frames'] = frames[0].split('.')[0] + '.%04d.jpg'
-      video_dict[video]['reshape'] = (240,320)
-      video_dict[video]['crop'] = (227, 227)
-      video_dict[video]['num_frames'] = num_frames
-      video_dict[video]['label'] = l
-      self.video_order.append(video) 
+      image_path, label = line.split()
+      l = float(label)
+      self.frames.append((image_path, l))
 
-    self.video_dict = video_dict
-    self.num_videos = len(video_dict.keys())
+    self.reshape = (float(self.height)/self.scale, float(self.width)/self.scale)
+    self.crop = (int(self.reshape[0]*.9), int(self.reshape[1]*.9))
+    self.reshape = (int(self.reshape[0]), int(self.reshape[1]))
 
-    #set up data transformer
-    shape = (self.N, self.channels, self.height, self.width)
+    print('self.reshape:', self.reshape)
+    print('self.crop:', self.crop)
+    
+    shape = (len(self.frames), self.channels, self.height, self.width)
         
     self.transformer = caffe.io.Transformer({'data_in': shape})
     self.transformer.set_raw_scale('data_in', 255)
-    if self.flow:
-      image_mean = [128, 128, 128]
-      self.transformer.set_is_flow('data_in', True)
-    else:
-      image_mean = [103.939, 116.779, 128.68]
-      self.transformer.set_is_flow('data_in', False)
-    channel_mean = np.zeros((3,227,227))
+    image_mean = [103.939, 116.779, 128.68]
+    channel_mean = np.zeros((3, self.crop[0], self.crop[1]))
     for channel_index, mean_val in enumerate(image_mean):
       channel_mean[channel_index, ...] = mean_val
     self.transformer.set_mean('data_in', channel_mean)
@@ -186,8 +121,8 @@ class videoRead(caffe.Layer):
     self.thread = None
     pool_size = 24
 
-    self.image_processor = ImageProcessorCrop(self.transformer, self.flow)
-    self.sequence_generator = sequenceGeneratorVideo(self.buffer_size, self.frames, self.num_videos, self.video_dict, self.video_order)
+    self.image_processor = ImageProcessorCrop(self.transformer)
+    self.sequence_generator = SequenceGenerator(self.frames)
 
     self.pool = Pool(processes=pool_size)
     self.batch_advancer = BatchAdvancer(self.thread_result, self.sequence_generator, self.image_processor, self.pool)
@@ -251,62 +186,16 @@ class videoRead(caffe.Layer):
   def backward(self, top, propagate_down, bottom):
     pass
 
-class videoReadTrain_flow(videoRead):
+# train/test specializations
+class SequenceReadTrain(SequenceRead):
 
   def initialize(self):
     self.train_or_test = 'train'
-    self.flow = True
-    self.buffer_size = train_buffer  #num videos processed per batch
-    self.frames = train_frames   #length of processed clip
-    self.N = self.buffer_size*self.frames
-    self.idx = 0
-    self.channels = 3
-    self.height = 227
-    self.width = 227
-    self.path_to_images = flow_frames 
-    self.video_list = 'ucf101_split1_trainVideos.txt' 
-
-class videoReadTest_flow(videoRead):
+    self.frames = train_frames
+    self.path_to_image_list = settings.train_images_list
+class SequenceReadTest(SequenceRead):
 
   def initialize(self):
     self.train_or_test = 'test'
-    self.flow = True
-    self.buffer_size = test_buffer  #num videos processed per batch
-    self.frames = test_frames   #length of processed clip
-    self.N = self.buffer_size*self.frames
-    self.idx = 0
-    self.channels = 3
-    self.height = 227
-    self.width = 227
-    self.path_to_images = flow_frames 
-    self.video_list = 'ucf101_split1_testVideos.txt' 
-
-class videoReadTrain_RGB(videoRead):
-
-  def initialize(self):
-    self.train_or_test = 'train'
-    self.flow = False
-    self.buffer_size = train_buffer  #num videos processed per batch
-    self.frames = train_frames   #length of processed clip
-    self.N = self.buffer_size*self.frames
-    self.idx = 0
-    self.channels = 3
-    self.height = 227
-    self.width = 227
-    self.path_to_images = RGB_frames 
-    self.video_list = 'ucf101_split1_trainVideos.txt' 
-
-class videoReadTest_RGB(videoRead):
-
-  def initialize(self):
-    self.train_or_test = 'test'
-    self.flow = False
-    self.buffer_size = test_buffer  #num videos processed per batch
-    self.frames = test_frames   #length of processed clip
-    self.N = self.buffer_size*self.frames
-    self.idx = 0
-    self.channels = 3
-    self.height = 227
-    self.width = 227
-    self.path_to_images = RGB_frames 
-    self.video_list = 'ucf101_split1_testVideos.txt' 
+    self.frames = test_frames
+    self.path_to_image_list = settings.test_images_list
